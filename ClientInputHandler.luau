@@ -72,7 +72,7 @@ function HitBoxModule.HitBox(data)
 	hitboxParams.FilterType = Enum.RaycastFilterType.Exclude
 	hitboxParams.FilterDescendantsInstances = {Ignore}
 
-	local alreadyHit        = {} -- so we don't hit the same target twice
+	local alreadyHit        = {} -- so u dont hit the same target twice
 	local connection
 
 	connection = RunService.Heartbeat:Connect(function()
@@ -95,7 +95,7 @@ function HitBoxModule.HitBox(data)
 
 				local attackFromBehind = isAttackFromBehind(HumanoidRootPart, eroot)
 
-				-- perfect block: negates the hit and staggers the attacker instead
+				-- perfect block negates the hit and staggers the attacker instead
 				if victim:GetAttribute("PerfectBlock") and not attackFromBehind then
 					if Blockable then
 
