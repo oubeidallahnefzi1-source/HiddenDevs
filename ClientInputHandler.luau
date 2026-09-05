@@ -1,655 +1,303 @@
--- Advanced Parkour Movement System
--- Client-Side Input Handler + Physics Controller
--- Created for HiddenDevs Scripter Role Application
+local Players             = game:GetService("Players")
+local UserInputService    = game:GetService("UserInputService")
+local ReplicatedStorage   = game:GetService("ReplicatedStorage")
+local RunService          = game:GetService("RunService")
+local Debris              = game:GetService("Debris")
+local TweenService        = game:GetService("TweenService")
 
--- This script handles advanced movement mechanics including:
--- • Toggleable Crouch with hip height adjustment and animations
--- • Momentum-based Sliding that gains speed on downward slopes and loses on upward
--- • Wall Running (left/right detection) with proper surface normal projection
--- • Quick Dash with cooldown and VFX integration
--- • Proper state synchronization with the server via Attributes and Remotes
--- • Clean cleanup and edge-case handling (respawn, obstructions, etc.)
+local Utils               = require(ReplicatedStorage.Main.Modules.Utils.Utils)
+local CombatAnimations = ReplicatedStorage.Main.CombatAssets.Animations
+local CombatConfig = require(ReplicatedStorage.Main.CombatAssets.Modules.CombatConfig)
 
--- Why this is sophisticated:
--- - Uses modern Roblox constraints (LinearVelocity + AlignOrientation) for sliding
--- - Projects movement direction onto wall surface for natural wall running
--- - Slope-aware speed multiplier with delta-time smoothing
--- - Separation of concerns: input handling, physics, animation, and state
+local HitBoxModule = {}
 
-local ClientInputHandler = {}
+local PERFECT_BLOCK_STAGGER_DURATION = CombatConfig.Block.PerfectBlockStaggerDuration
+local BACKSTAB_DOT_THRESHOLD = CombatConfig.Block.BackstabDotThreshold
 
--- Services
-local UserInputService = game:GetService("UserInputService")
-local RunService = game:GetService("RunService")
-local Debris = game:GetService("Debris")
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local TweenService = game:GetService("TweenService")
-
-local LocalPlayer = Players.LocalPlayer
-
--- Required modules (assuming these exist in your game)
-local Animations = require(ReplicatedStorage:WaitForChild("AnimationData"))
-local Utils = require(ReplicatedStorage:WaitForChild("Modules").Utils.Utils)
-
--- Remotes for server communication
-local AttributeRemote = ReplicatedStorage.Main.Shared.Remotes.AttributeRemote
-local InputEvent = ReplicatedStorage.Main.Shared.Remotes.InputEvent
-
--- Configuration Table
--- All tunable values are centralized here for easy balancing
-local Settings = {
-	CrouchWalkSpeed = 9,
-	CrouchHipDelta = -1.4,
-	Cooldown = 0.1,
-	BaseSlideSpeed = 95,
-	TurnRate = 19,                    -- How fast the slide direction can turn
-	SlideMaxForce = 80000,
-	SlideResponsiveness = 25,
-	SlideMaxTorque = 250000,
-	HipHeight = {
-		Normal = 0,
-		Slide = -2,
-	},
-	MaxMultiplier = 2,                -- Max speed multiplier on steep down slopes
-	SpeedChangeRate = {
-		Forward = 0.5,
-		Upward = 2,
-		Downward = 1,
-	},
-	PushOnCancel = true,              -- Give a boost when manually canceling slide
-	PushVelocity = {
-		Forward = 50,
-		Up = 50,
-	},
-}
-
--- Character references (set on CharacterAdded)
-local Character, RootPart, Humanoid
-
--- State flags
-local isWallRunning = false
-local isCrouching = false
-local isSliding = false
-local CanSlide = true
-local CanDash = true
-
--- Slide variables
-local CurrentMultiplier = 1
-local SavedAutoRotate
-local SlideDir
-local SavedWalkSpeed
-local SavedJumpHeight
-local SlideLinearVelocity
-local SlideAlignOrientation
-local SlideAttachment
-
--- Wall Run variables
-local WallRunSide
-local WallRunBodyVelocity
-local WallRunGyro
-local WallRunDir
-local WallRunPosCheck
-
--- Animations
-local RightWallRunAnim, LeftWallRunAnim, WallRunCancelAnim
-local RightWallRunCancelAnim, LeftWallRunCancelAnim
-local CrouchIdleAnim, CrouchWalkAnim
-local SlideStartAnim, SlideLoopAnim
-
--- Sounds
-local WallRunSound = script.VFX:FindFirstChild("WallRun")
-local SlideLoopSound = script.VFX:FindFirstChild("Slide_Loop")
-local SlideCancelSound = script.VFX:FindFirstChild("Slide_Cancel")
-local BaseSoundVolume = (SlideLoopSound and SlideLoopSound.Volume) or 0
-
--- Raycast parameters (excludes character)
-local RaycastParams = RaycastParams.new()
-RaycastParams.FilterType = Enum.RaycastFilterType.Exclude
-
--- Internal state
-local Started = false
-local RenderConnection
-
--- Helper: Update UI button highlight
-local function HandleUi(Name: string, NewName: string?, On: boolean)
-	local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
-	local KeyUI = PlayerGui:WaitForChild("KeyUI")
-	local KeyUIFrame = KeyUI:WaitForChild("KeyUIFrame")
-	local Button = KeyUIFrame:FindFirstChild(Name)
-	if not Button then return end
-
-	if NewName then
-		Button.SkillName.Text = NewName
+-- checks if attack came from behind the victim using dot product
+local function isAttackFromBehind(attackerRoot, victimRoot)
+	local offset = attackerRoot.Position - victimRoot.Position
+	local flatOffset = Vector3.new(offset.X, 0, offset.Z)
+	if flatOffset.Magnitude < 0.01 then
+		return false
 	end
-	Button.COLOR.Visible = On
+	local dot = victimRoot.CFrame.LookVector:Dot(flatOffset.Unit)
+	return dot < BACKSTAB_DOT_THRESHOLD
 end
 
--- Load animation track
-local function LoadTrack(AnimId: string)
-	local Anim = Instance.new("Animation")
-	Anim.AnimationId = AnimId
-	local Animator = Humanoid:FindFirstChildOfClass("Animator") or Humanoid:WaitForChild("Animator")
-	return Animator:LoadAnimation(Anim)
-end
+-- creates a hitbox part that checks for overlaps every heartbeat
+function HitBoxModule.HitBox(data)
+	local Character         = data.Character
+	local Player            = Players:GetPlayerFromCharacter(Character)
+	local HumanoidRootPart  = Character:WaitForChild("HumanoidRootPart")
+	local Humanoid          = Character:WaitForChild("Humanoid")
 
--- Stop crouch animations cleanly
-local function StopCrouchAnims()
-	if CrouchIdleAnim then CrouchIdleAnim:Stop(0.12) end
-	if CrouchWalkAnim then CrouchWalkAnim:Stop(0.12) end
-end
+	-- unpacking attack settings with fallback defaults
+	local Size              = data.Size
+	local Ignore            = data.Ignore or {}
+	local OnHitFunc         = data.OnHitFunc
+	local WeldValue         = data.Weld
+	local HBCFrame          = data.CFrame
+	local WeldTo            = data.WeldTo or HumanoidRootPart
+	local Time              = data.Time or 100
+	local Damage            = data.Damage or 0
+	local CanPB             = data.CanPB
+	local Blockable         = data.Blockable ~= false
+	local Combo             = data.Combo or 1
+	local AttackerState     = data.MyState
+	local PostureCost 		= data.PostureCost or 0
+	local DEFAULT_MAX_POSTURE = CombatConfig.Posture.Max
 
--- Update crouch idle/walk animation based on movement
-local function UpdateCrouchAnim()
-	if not isCrouching or isSliding or not Humanoid then return end
+	local HitBox            = Instance.new("Part")
+	HitBox.Name             = "HitBox"
+	HitBox.Anchored         = true
+	HitBox.CanCollide       = false
+	HitBox.Size             = Size
+	HitBox.Color            = Color3.fromRGB(255, 0, 0)
+	HitBox.Transparency     = 1
+	HitBox.Massless         = true
+	HitBox.Material         = Enum.Material.ForceField
+	HitBox.CFrame           = HBCFrame
+	HitBox.Parent           = workspace.FX
 
-	local Moving = Humanoid.MoveDirection.Magnitude > 0.05
-
-	if Moving then
-		if CrouchIdleAnim and CrouchIdleAnim.IsPlaying then CrouchIdleAnim:Stop(0.12) end
-		if CrouchWalkAnim and not CrouchWalkAnim.IsPlaying then
-			CrouchWalkAnim:Play(0.12)
-			CrouchWalkAnim:AdjustSpeed(0.7)
-		end
-	else
-		if CrouchWalkAnim and CrouchWalkAnim.IsPlaying then CrouchWalkAnim:Stop(0.12) end
-		if CrouchIdleAnim and not CrouchIdleAnim.IsPlaying then
-			CrouchIdleAnim:Play(0.12)
-		end
-	end
-end
-
--- Get / Set character state via attribute (synced to server)
-local function GetState()
-	return Character and Character:GetAttribute("State")
-end
-
-local function SetState(Value: string?)
-	if Character then
-		AttributeRemote:FireServer(Character, "State", Value)
-	end
-end
-
--- Check if there's a ceiling blocking uncrouch
-local function CanUncrouch()
-	return workspace:Raycast(RootPart.Position, Vector3.new(0, 4, 0), RaycastParams) == nil
-end
-
--- Check if player is in air
-local function IsAirborne(Humanoid: Humanoid)
-	local State = Humanoid:GetState()
-	return State == Enum.HumanoidStateType.Freefall or State == Enum.HumanoidStateType.Jumping
-end
-
--- ====================== CROUCH SYSTEM ======================
-local function SetCrouch(On: boolean)
-	if isSliding or isWallRunning then return end
-	if not Character or not Humanoid then return end
-	if GetState() == "Dashing" then return end
-	if isCrouching == On then return end
-	if IsAirborne(Humanoid) then return end
-	if not On and not CanUncrouch() then return end
-
-	isCrouching = On
-	HandleUi("CROUCH", "CROUCH", On)
-
-	-- Crouch sound
-	local Sound = script.VFX:FindFirstChild("Crouch")
-	if Sound and RootPart then
-		local Clone = Sound:Clone()
-		Clone.Parent = RootPart
-		Clone:Play()
-		Debris:AddItem(Clone, 1)
+	-- makes hitbox follow the attacker if needed
+	if WeldValue == true then
+		local weld            = Instance.new("WeldConstraint")
+		weld.Parent           = HitBox
+		weld.Part0            = WeldTo
+		weld.Part1            = HitBox
 	end
 
-	if On then
-		SavedWalkSpeed = SavedWalkSpeed or Humanoid.WalkSpeed
-		SavedJumpHeight = SavedJumpHeight or Humanoid.JumpHeight
+	local hitboxParams      = OverlapParams.new()
+	hitboxParams.FilterType = Enum.RaycastFilterType.Exclude
+	hitboxParams.FilterDescendantsInstances = {Ignore}
 
-		SetState("Crouch")
-		Humanoid.JumpHeight = 0
-		Humanoid.WalkSpeed = Settings.CrouchWalkSpeed
-		Humanoid.HipHeight = Settings.HipHeight.Normal + Settings.CrouchHipDelta
-		UpdateCrouchAnim()
-	else
-		SetState(nil)
-		Humanoid.HipHeight = Settings.HipHeight.Normal
-		StopCrouchAnims()
+	local alreadyHit        = {} -- so we don't hit the same target twice
+	local connection
 
-		if SavedWalkSpeed then
-			Humanoid.WalkSpeed = SavedWalkSpeed
-			SavedWalkSpeed = nil
-		end
-		if SavedJumpHeight then
-			Humanoid.JumpHeight = SavedJumpHeight
-			SavedJumpHeight = nil
-		end
-	end
-end
-
--- ====================== SLIDING SYSTEM ======================
-local function DestroySlideConstraints()
-	if SlideLinearVelocity then SlideLinearVelocity:Destroy(); SlideLinearVelocity = nil end
-	if SlideAlignOrientation then SlideAlignOrientation:Destroy(); SlideAlignOrientation = nil end
-end
-
-local function StopSlide()
-	isSliding = false
-	HandleUi("CROUCH", "CROUCH", false)
-
-	if SlidePosCheck then SlidePosCheck:Disconnect(); SlidePosCheck = nil end
-	DestroySlideConstraints()
-
-	if SlideStartAnim then SlideStartAnim:Stop(0.1) end
-	if SlideLoopAnim then SlideLoopAnim:Stop(0.15) end
-	if SlideLoopSound then SlideLoopSound:Stop() end
-
-	if Humanoid then
-		if SavedAutoRotate ~= nil then
-			Humanoid.AutoRotate = SavedAutoRotate
-		end
-
-		if RootPart and CanUncrouch() then
-			Humanoid.HipHeight = Settings.HipHeight.Normal
-			if GetState() == "Slide" then SetState(nil) end
-		else
-			SetCrouch(true)
-		end
-	end
-
-	SavedAutoRotate = nil
-	SlideDir = nil
-
-	task.delay(Settings.Cooldown, function()
-		CanSlide = true
-	end)
-end
-
-local function StartSlide()
-	if not Character or not RootPart or not Humanoid then return end
-	if GetState() ~= "Sprint" or GetState() == "Dashing" then return end
-
-	-- Must be on ground
-	local GroundRay = workspace:Raycast(RootPart.Position, -RootPart.CFrame.UpVector * 5, RaycastParams)
-	if isSliding or not CanSlide or not GroundRay then return end
-
-	if isCrouching then SetCrouch(false) end
-
-	isSliding = true
-	CanSlide = false
-	SetState("Slide")
-
-	-- Sound
-	local Sound = script.VFX:FindFirstChild("Crouch")
-	if Sound and RootPart then
-		local Clone = Sound:Clone()
-		Clone.Parent = RootPart
-		Clone:Play()
-		Debris:AddItem(Clone, 1)
-	end
-
-	SavedAutoRotate = Humanoid.AutoRotate
-	Humanoid.AutoRotate = false
-	RootPart.AssemblyAngularVelocity = Vector3.zero
-
-	if SlideStartAnim then SlideStartAnim:Play(0.05) end
-	if SlideLoopAnim then SlideLoopAnim:Play(0.15) end
-	if SlideLoopSound then SlideLoopSound:Play() end
-
-	Humanoid.HipHeight = Settings.HipHeight.Slide
-
-	-- Initial slide direction (forward)
-	local Dir = RootPart.CFrame.LookVector
-	SlideDir = Vector3.new(Dir.X, 0, Dir.Z).Unit
-
-	DestroySlideConstraints()
-
-	-- LinearVelocity for forward momentum
-	SlideLinearVelocity = Instance.new("LinearVelocity")
-	SlideLinearVelocity.Attachment0 = SlideAttachment
-	SlideLinearVelocity.RelativeTo = Enum.ActuatorRelativeTo.World
-	SlideLinearVelocity.ForceLimitMode = Enum.ForceLimitMode.PerAxis
-	SlideLinearVelocity.MaxAxesForce = Vector3.new(Settings.SlideMaxForce, 0, Settings.SlideMaxForce)
-	SlideLinearVelocity.Parent = RootPart
-
-	-- AlignOrientation to keep player facing slide direction + ground normal
-	SlideAlignOrientation = Instance.new("AlignOrientation")
-	SlideAlignOrientation.Attachment0 = SlideAttachment
-	SlideAlignOrientation.Mode = Enum.OrientationAlignmentMode.OneAttachment
-	SlideAlignOrientation.Responsiveness = Settings.SlideResponsiveness
-	SlideAlignOrientation.MaxTorque = Settings.SlideMaxTorque
-	SlideAlignOrientation.Parent = RootPart
-
-	local PreviousY = RootPart.Position.Y
-	CurrentMultiplier = 1
-
-	-- Main slide loop (runs every frame)
-	SlidePosCheck = RunService.Heartbeat:Connect(function(DeltaTime)
-		local CurrentY = RootPart.Position.Y
-		local VerticalChange = CurrentY - PreviousY
-		PreviousY = CurrentY
-
-		-- Stop if no longer on ground
-		local Ground = workspace:Raycast(RootPart.Position, -RootPart.CFrame.UpVector * 10, RaycastParams)
-		if not Ground then
-			StopSlide()
+	connection = RunService.Heartbeat:Connect(function()
+		if HitBox.Parent == nil then
+			connection:Disconnect()
 			return
 		end
 
-		-- Update desired direction (player input or camera)
-		local Desired = Humanoid.MoveDirection
-		if Desired.Magnitude < 0.05 and workspace.CurrentCamera then
-			Desired = workspace.CurrentCamera.CFrame.LookVector
+		local parts = workspace:GetPartsInPart(HitBox, hitboxParams)
+
+		for _, part in pairs(parts) do
+			local victim     = part:FindFirstAncestorWhichIsA("Model")
+			if not victim then continue end
+
+			local ehum       = victim:FindFirstChildOfClass("Humanoid")
+			local eroot      = victim:FindFirstChild("HumanoidRootPart")
+
+			if ehum and eroot and not alreadyHit[ehum] and ehum.Health > 0 then
+				alreadyHit[ehum] = true
+
+				local attackFromBehind = isAttackFromBehind(HumanoidRootPart, eroot)
+
+				-- perfect block: negates the hit and staggers the attacker instead
+				if victim:GetAttribute("PerfectBlock") and not attackFromBehind then
+					if Blockable then
+
+						local CombatVFX = ReplicatedStorage.Main.CombatAssets.VFX
+						local CombatSounds = ReplicatedStorage.Main.CombatAssets.Sounds
+
+						local BlockHitReactionAnimation = CombatAnimations.BlockHitReaction["BlockHitReaction" .. math.random(1, 2)]
+
+						local Animator = ehum:FindFirstChildOfClass("Animator")
+						if not Animator then
+							return
+						end
+
+						local BlockHitReactionTrack = Animator:LoadAnimation(BlockHitReactionAnimation)
+						BlockHitReactionTrack:Play()
+
+						local SoundName = tostring("PerfectBlock" .. math.random(1, 5))
+						local Sound = CombatSounds.PerfectBlockSounds:FindFirstChild(SoundName)
+
+						local PerfectBlockSound = Sound:Clone()
+
+						PerfectBlockSound.Parent = eroot
+						PerfectBlockSound:Play()
+
+						local ParryVFX      = CombatVFX.Parry:Clone()
+						ParryVFX.Parent     = workspace.FX
+						ParryVFX.CFrame = eroot.CFrame * CFrame.new(0, -0.3, -1.2)
+						Utils.Emit(ParryVFX)
+
+						local PerfectBlockHighlight = Instance.new("Highlight")
+						PerfectBlockHighlight.FillTransparency, PerfectBlockHighlight.OutlineTransparency = 1, 1
+						PerfectBlockHighlight.FillColor = Color3.new(1, 0.333333, 1)
+						PerfectBlockHighlight.Parent = victim
+
+						task.spawn(function()
+							local TweenIn = game:GetService("TweenService"):Create(PerfectBlockHighlight, TweenInfo.new(0.1), {FillTransparency = 0.5})
+							TweenIn:Play()
+							task.wait(0.1)
+							local TweenOut = game:GetService("TweenService"):Create(PerfectBlockHighlight, TweenInfo.new(0.1), {FillTransparency = 1})
+							TweenOut:Play()
+						end)
+
+						task.delay(2, function() PerfectBlockSound:Destroy() end)
+						task.delay(2, function() ParryVFX:Destroy() end)
+
+						-- punish the attacker with a stagger
+						if AttackerState then
+							AttackerState:Stagger(PERFECT_BLOCK_STAGGER_DURATION)
+						end
+						
+
+					end
+					return
+				end
+
+				-- regular block: drains posture instead of taking damage
+				if victim:GetAttribute("IsBlocking") and not attackFromBehind then
+					if Blockable then
+
+						local CombatVFX = ReplicatedStorage.Main.CombatAssets.VFX
+						local CombatSounds = ReplicatedStorage.Main.CombatAssets.Sounds
+
+						local BlockHitReactionAnimation = CombatAnimations.BlockHitReaction["BlockHitReaction" .. math.random(1, 2)]
+
+						local Animator = ehum:FindFirstChildOfClass("Animator")
+						if not Animator then
+							return
+						end
+
+						local BlockHitReactionTrack = Animator:LoadAnimation(BlockHitReactionAnimation)
+						BlockHitReactionTrack:Play()
+
+						-- picks the block sound based on combo number
+						local SoundName = "Block" .. tostring(Combo)
+						local Sound = CombatSounds.BlockSounds:FindFirstChild(SoundName)
+
+						local BlockSound = Sound:Clone()
+
+						BlockSound.Parent = eroot
+						BlockSound:Play()
+
+						local BlockVFX      = CombatVFX.Block:Clone()
+						BlockVFX.Parent     = workspace.FX
+						BlockVFX.CFrame = eroot.CFrame * CFrame.new(0, -0.3, -1.2)
+						Utils.Emit(BlockVFX)
+
+						local BlockHighlight = Instance.new("Highlight")
+						BlockHighlight.FillTransparency, BlockHighlight.OutlineTransparency = 1, 1
+						BlockHighlight.FillColor = Color3.new(1, 0.541176, 0.27451)
+						BlockHighlight.Parent = victim
+
+						task.spawn(function()
+							local TweenIn = game:GetService("TweenService"):Create(BlockHighlight, TweenInfo.new(0.1), {FillTransparency = 0.5})
+							TweenIn:Play()
+							task.wait(0.1)
+							local TweenOut = game:GetService("TweenService"):Create(BlockHighlight, TweenInfo.new(0.1), {FillTransparency = 1})
+							TweenOut:Play()
+						end)
+
+						task.delay(2, function() BlockSound:Destroy() end)
+						task.delay(2, function() BlockVFX:Destroy() end)
+
+						-- drain posture, clamped so it can't go negative
+						if PostureCost > 0 then
+							local current = victim:GetAttribute("Posture") or DEFAULT_MAX_POSTURE
+							victim:SetAttribute("Posture", math.max(0, current - PostureCost))
+						end
+
+					end
+					return
+				end
+
+				-- hit landed for real, no block or parry
+				OnHitFunc(ehum, victim)
+				
+				task.spawn(function()
+					HitBoxModule.HitFx(eroot, Damage, Color3.new(255, 0, 0))
+				end)
+			end
 		end
-		Desired = Vector3.new(Desired.X, 0, Desired.Z)
+	end)
 
-		if Desired.Magnitude > 0.01 then
-			Desired = Desired.Unit
-			local Alpha = math.clamp(Settings.TurnRate * DeltaTime, 0, 1)
-			SlideDir = (SlideDir:Lerp(Desired, Alpha)).Unit
-		end
-
-		-- Project slide direction onto the ground plane
-		local Up = Ground.Normal
-		local Forward = SlideDir - Up * SlideDir:Dot(Up)
-		if Forward.Magnitude < 0.01 then Forward = SlideDir else Forward = Forward.Unit end
-
-		SlideAlignOrientation.CFrame = CFrame.lookAt(RootPart.Position, RootPart.Position + Forward, Up)
-		SlideLinearVelocity.VectorVelocity = Forward * (Settings.BaseSlideSpeed * CurrentMultiplier)
-
-		-- Slope speed multiplier logic
-		if math.abs(VerticalChange) < 0.1 then
-			local Rate = Settings.SpeedChangeRate.Forward
-			if CurrentMultiplier > 1 then Rate *= 2 end
-			CurrentMultiplier = math.clamp(CurrentMultiplier - Rate * DeltaTime, 0, Settings.MaxMultiplier)
-		elseif VerticalChange > 0 then
-			-- Going uphill → lose speed faster
-			local Rate = Settings.SpeedChangeRate.Upward
-			if CurrentMultiplier > 1 then Rate *= 2 end
-			CurrentMultiplier = math.clamp(CurrentMultiplier - Rate * DeltaTime, 0, Settings.MaxMultiplier)
-		else
-			-- Going downhill → gain speed
-			CurrentMultiplier = math.clamp(CurrentMultiplier + Settings.SpeedChangeRate.Downward * DeltaTime, 0, Settings.MaxMultiplier)
-		end
-
-		if SlideLoopSound then
-			SlideLoopSound.Volume = BaseSoundVolume * CurrentMultiplier
-		end
-
-		if CurrentMultiplier < 0.1 then
-			StopSlide()
-		end
+	-- clean up the hitbox after its active window ends
+	task.delay(Time, function()
+		if HitBox then HitBox:Destroy() end
 	end)
 end
 
--- ====================== WALL RUN SYSTEM ======================
-local function StopWallRun()
-	if WallRunPosCheck then WallRunPosCheck:Disconnect(); WallRunPosCheck = nil end
-	if LeftWallRunAnim and LeftWallRunAnim.IsPlaying then LeftWallRunAnim:Stop(0.1) end
-	if RightWallRunAnim and RightWallRunAnim.IsPlaying then RightWallRunAnim:Stop(0.1) end
 
-	HandleUi("WALLRUN", "WALLRUN", false)
-
-	if Humanoid then Humanoid.AutoRotate = true end
-	if WallRunGyro then WallRunGyro:Destroy(); WallRunGyro = nil end
-	if WallRunBodyVelocity then WallRunBodyVelocity:Destroy(); WallRunBodyVelocity = nil end
-	if WallRunSound then WallRunSound:Stop() end
-
-	isWallRunning = false
-	if GetState() == "WallRun" then SetState(nil) end
+-- formats damage text, avoids trailing zeros
+local function cleanNum(n)
+	return (math.floor(n) == n) and tostring(n) or string.format("%.1f", n)
 end
 
-local function CancelWallRun(Side: string)
-	if not isWallRunning or not RootPart then return end
-	StopWallRun()
+-- floating damage number that pops up and fades
+function HitBoxModule.HitFx(HumanoidRootPart, Damage, Color)
+	if not HumanoidRootPart then return end
 
-	-- Push player off wall with nice momentum
-	local MoveDir = Humanoid.MoveDirection
-	local Right = RootPart.CFrame.RightVector
-	local Forward = RootPart.CFrame.LookVector
-	local Dot = MoveDir:Dot(Right)
+	local Hit = script:WaitForChild("Hit"):Clone()
+	local bill = Hit:WaitForChild("Bill")
+	local frame = bill:WaitForChild("Frame")
+	local text1 = frame:WaitForChild("TextLabel")
+	local text2 = text1:FindFirstChild("TextLabel")
 
-	local HasInput = MoveDir.Magnitude > 0.15
-	local OppositeDir = (Side == "Right" and Dot < -0.25) or (Side == "Left" and Dot > 0.25)
-
-	local Sideways = Vector3.zero
-	local ForwardPush = Vector3.zero
-	local Upward = Vector3.new(0, 100, 0)
-	local Anim = WallRunCancelAnim
-
-	if HasInput and OppositeDir then
-		Sideways = (Side == "Right") and (-Right * 110) or (Right * 110)
-		ForwardPush = Forward * 50
-		Upward = Vector3.new(0, 70, 0)
-		Anim = (Side == "Right") and RightWallRunCancelAnim or LeftWallRunCancelAnim
+	local dmgText = cleanNum(Damage)
+	text1.TextColor3 = Color
+	text1.Text = dmgText
+	if text2 then
+		text2.Text = dmgText
 	end
 
-	Anim:Play(0.05)
-	Anim.Priority = Enum.AnimationPriority.Action3
+	-- randomized start position so multi hit combos don't stack numbers on top of each other
+	local startCFrame = HumanoidRootPart.CFrame * CFrame.new(
+		math.random(-15, 15) / 10,
+		math.random(0, 15) / 10,
+		math.random(-15, 15) / 10
+	)
 
-	RootPart.AssemblyLinearVelocity = Sideways + Upward + ForwardPush
+	Hit.CFrame = startCFrame
+	Hit.Anchored = true
+	Hit.CanCollide = false
+	Hit.Parent = workspace
 
-	-- Visual feedback
-	local Spin = script.VFX.Spin:Clone()
-	Spin.Parent = RootPart
-	Spin:Play()
-	Debris:AddItem(Spin, 0.6)
+	local upHeight = math.random(25, 45) / 10
+	local driftX = math.random(-10, 10) / 10
+	local driftZ = math.random(-10, 10) / 10
+	local spin = math.random(-25, 25)
 
-	InputEvent:FireServer("ApplyBodyTrail", {"On"})
-	task.delay(0.3, function()
-		InputEvent:FireServer("ApplyBodyTrail", {"Off"})
-	end)
-end
+	-- rises and spins to a peak, then falls and finishes the spin
+	local peakCFrame = startCFrame
+		* CFrame.new(driftX * 0.5, upHeight, driftZ * 0.5)
+		* CFrame.Angles(0, math.rad(spin * 0.5), 0)
 
-local function SetWallRun(On: boolean)
-	if not On then
-		CancelWallRun(WallRunSide)
-		return
-	end
+	local endCFrame = peakCFrame
+		* CFrame.new(driftX * 0.5, -(upHeight + 1), driftZ * 0.5)
+		* CFrame.Angles(0, math.rad(spin), 0)
 
-	if isSliding or isCrouching or isWallRunning or GetState() == "Dashing" or not IsAirborne(Humanoid) then return end
+	local upInfo = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	local downInfo = TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
 
-	-- Detect wall on left or right
-	local RayDir = RootPart.CFrame.RightVector * 2.3
-	local RightHit = workspace:Raycast(RootPart.Position, RayDir, RaycastParams)
-	local LeftHit = workspace:Raycast(RootPart.Position, -RayDir, RaycastParams)
+	local upTween = TweenService:Create(Hit, upInfo, { CFrame = peakCFrame })
+	local downTween = TweenService:Create(Hit, downInfo, { CFrame = endCFrame })
 
-	local Hit, Side
-	if RightHit and LeftHit then
-		if RightHit.Distance <= LeftHit.Distance then
-			Hit, Side = RightHit, "Right"
-		else
-			Hit, Side = LeftHit, "Left"
-		end
-	elseif RightHit then
-		Hit, Side = RightHit, "Right"
-	elseif LeftHit then
-		Hit, Side = LeftHit, "Left"
-	else
-		return
-	end
-
-	isWallRunning = true
-	WallRunSide = Side
-	SetState("WallRun")
-	Humanoid.AutoRotate = false
-	HandleUi("WALLRUN", "WALLRUN", true)
-
-	if WallRunSound then WallRunSound:Play() end
-
-	-- Play correct animation
-	if Side == "Left" then
-		if RightWallRunAnim then RightWallRunAnim:Stop(0.05) end
-		if LeftWallRunAnim then
-			LeftWallRunAnim:Play(0.05)
-			LeftWallRunAnim.Priority = Enum.AnimationPriority.Action4
-		end
-	else
-		if LeftWallRunAnim then LeftWallRunAnim:Stop(0.05) end
-		if RightWallRunAnim then
-			RightWallRunAnim:Play(0.05)
-			RightWallRunAnim.Priority = Enum.AnimationPriority.Action4
-		end
-	end
-
-	-- Physics
-	if not WallRunBodyVelocity then
-		WallRunBodyVelocity = Instance.new("BodyVelocity")
-		WallRunBodyVelocity.MaxForce = Vector3.new(1,1,1) * 30000
-		WallRunBodyVelocity.Parent = RootPart
-	end
-
-	if not WallRunGyro then
-		WallRunGyro = Instance.new("BodyGyro")
-		WallRunGyro.MaxTorque = Vector3.new(0,1,0) * 1e7
-		WallRunGyro.Parent = RootPart
-	end
-
-	local function ApplyMotion(WallNormal: Vector3)
-		local Up = Vector3.new(0,1,0)
-		local RunDir = Up:Cross(WallNormal).Unit
-
-		-- Make sure we run in the direction the player is facing
-		if RunDir:Dot(RootPart.CFrame.LookVector) < 0 then
-			RunDir = -RunDir
-		end
-
-		WallRunDir = RunDir
-		WallRunBodyVelocity.Velocity = Vector3.new(RunDir.X * 65, -5, RunDir.Z * 65)
-		WallRunGyro.CFrame = CFrame.lookAt(RootPart.Position, RootPart.Position + RunDir, Up)
-	end
-
-	ApplyMotion(Hit.Normal)
-
-	-- Continuous wall check
-	WallRunPosCheck = RunService.Heartbeat:Connect(function()
-		if not isWallRunning then StopWallRun(); return end
-		if not IsAirborne(Humanoid) then StopWallRun(); return end
-
-		local CheckDir = (WallRunSide == "Right") and RootPart.CFrame.RightVector * 4 or -RootPart.CFrame.RightVector * 4
-		local WallHit = workspace:Raycast(RootPart.Position, CheckDir, RaycastParams)
-
-		if not WallHit then
-			StopWallRun()
-			return
-		end
-
-		ApplyMotion(WallHit.Normal)
-	end)
-end
-
--- ====================== DASH ======================
-local function StartDashCooldown()
-	CanDash = false
-	task.delay(0.5, function() CanDash = true end)
-end
-
-function ClientInputHandler.Dash()
-	if not CanDash then return end
-
-	HandleUi("DASH", "DASH", true)
-	SetState("Dashing")
-	InputEvent:FireServer("DashVFX", {"On"})
-
-	local DashVel = Instance.new("LinearVelocity")
-	DashVel.Attachment0 = SlideAttachment -- reuse or create DashAttachment if you prefer
-	DashVel.RelativeTo = Enum.ActuatorRelativeTo.World
-	DashVel.MaxAxesForce = Vector3.new(80000, 80000, 80000)
-	DashVel.VectorVelocity = workspace.CurrentCamera.CFrame.LookVector * 120
-	DashVel.Parent = RootPart
-
-	task.delay(0.2, function()
-		if DashVel then DashVel:Destroy() end
-		HandleUi("DASH", "DASH", false)
-		SetState(nil)
-		InputEvent:FireServer("DashVFX", {"Off"})
-	end)
-
-	StartDashCooldown()
-end
-
--- ====================== PUBLIC API ======================
-function ClientInputHandler.CancelSlide()
-	if not isSliding or not RootPart then return end
-
-	if SlideCancelSound then SlideCancelSound:Play() end
-	StopSlide()
-
-	-- Visual cancel feedback
-	if WallRunCancelAnim then
-		WallRunCancelAnim:Play(0.05)
-		WallRunCancelAnim.Priority = Enum.AnimationPriority.Action3
-	end
-
-	InputEvent:FireServer("ApplyBodyTrail", {"On"})
-	task.delay(0.3, function()
-		InputEvent:FireServer("ApplyBodyTrail", {"Off"})
-	end)
-
-	if Settings.PushOnCancel then
-		RootPart.AssemblyLinearVelocity = RootPart.CFrame.LookVector * 120 + Vector3.new(0, 100, 0)
-	end
-end
-
-function ClientInputHandler.StopEverything(Opts: {ForceStand: boolean?, Disconnect: boolean?}?)
-	Opts = Opts or {}
-	-- ... (your existing StopEverything logic with comments can be added here if you want)
-	-- I kept it short for this response but you can expand it the same way
-end
-
-function ClientInputHandler.ToggleCrouch() SetCrouch(not isCrouching) end
-function ClientInputHandler.TrySlide() StartSlide() end
-function ClientInputHandler.ToggleWallRun() SetWallRun(not isWallRunning) end
-
-function ClientInputHandler.SlideStatus() return isSliding end
-function ClientInputHandler.WallRunStatus() return isWallRunning end
-
--- Character setup on spawn / respawn
-local function BindCharacter(Char)
-	Character = Char
-	RootPart = Char:WaitForChild("HumanoidRootPart")
-	Humanoid = Char:WaitForChild("Humanoid")
-
-	RaycastParams.FilterDescendantsInstances = {Char}
-
-	Settings.HipHeight.Normal = Humanoid.HipHeight
-
-	-- Attachments
-	SlideAttachment = RootPart:FindFirstChild("SlideAttachment") or Instance.new("Attachment")
-	SlideAttachment.Name = "SlideAttachment"
-	SlideAttachment.Parent = RootPart
-
-	-- Load all animations
-	WallRunCancelAnim = LoadTrack(Animations.WallRunCancelAnim)
-	RightWallRunCancelAnim = LoadTrack(Animations.RightWallRunCancelAnim)
-	LeftWallRunCancelAnim = LoadTrack(Animations.LeftWallRunCancelAnim)
-	RightWallRunAnim = LoadTrack(Animations.RightWallRunAnim)
-	LeftWallRunAnim = LoadTrack(Animations.LeftWallRunAnim)
-	CrouchIdleAnim = LoadTrack(Animations.CrouchIdle)
-	CrouchWalkAnim = LoadTrack(Animations.CrouchWalk)
-	SlideStartAnim = Animations.SlideStart and LoadTrack(Animations.SlideStart) or nil
-	SlideLoopAnim = Animations.SlideLoop and LoadTrack(Animations.SlideLoop) or nil
-
-	-- Reset states
-	isWallRunning = false
-	isCrouching = false
-	isSliding = false
-	CanSlide = true
-end
-
-function ClientInputHandler.Start()
-	if Started then return end
-	Started = true
-
-	LocalPlayer.CharacterAdded:Connect(BindCharacter)
-	if LocalPlayer.Character then BindCharacter(LocalPlayer.Character) end
-
-	-- RenderStepped for smooth animation updates
-	RenderConnection = RunService.RenderStepped:Connect(function()
-		if isCrouching and not isSliding then
-			UpdateCrouchAnim()
+	upTween:Play()
+	upTween.Completed:Connect(function()
+		if Hit and Hit.Parent then
+			downTween:Play()
 		end
 	end)
+
+	-- fades the text out before the number gets destroyed
+	task.delay(0.15, function()
+		if not Hit or not Hit.Parent then return end
+		local fadeTweenInfo = TweenInfo.new(0.6, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut)
+		local fadeGoal = { TextTransparency = 1, TextStrokeTransparency = 1 }
+		TweenService:Create(text1, fadeTweenInfo, fadeGoal):Play()
+		if text2 then
+			TweenService:Create(text2, fadeTweenInfo, fadeGoal):Play()
+		end
+	end)
+
+	Debris:AddItem(Hit, 1.6)
 end
 
-return ClientInputHandler
+return HitBoxModule
