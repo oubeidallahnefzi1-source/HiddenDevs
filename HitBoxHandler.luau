@@ -1,5 +1,6 @@
 -- Discord: Nezz(efsbxk) | Roblox: MOU7EB
--- Combat hitbox system: overlap hitboxes, blocking, perfect blocks, backstabs and a posture meter.
+-- Combat hitbox module: overlap hitboxes, blocking, perfect blocks, backstabs and a posture meter.
+-- ModuleScript: require it from your combat code, then call Hitbox.new({...}):Start().
 
 --// Services
 local CollectionService = game:GetService("CollectionService") -- tags let ONE loop manage every combatant
@@ -9,7 +10,7 @@ local TweenService = game:GetService("TweenService")
 
 --// Configuration: every tunable value lives here so balancing never means hunting through logic
 local CONFIG = {
-	Debug = true, -- shows the hitbox volume so the demo makes the detection area visible
+	Debug = false, -- when true, makes the hitbox part visible so the detection area can be seen while testing
 	BackstabDot = -0.25, -- a dot product below this means the attacker is behind the victim
 	MaxPosture = 100, -- "guard health": blocking drains it, reaching 0 breaks the guard
 	PostureRegenPerSecond = 8,
@@ -82,10 +83,10 @@ local function flash(character: Model, color: Color3)
 	highlight.Parent = character
 	local fadeIn = TweenService:Create(highlight, TweenInfo.new(0.1), { FillTransparency = 0.5 })
 	fadeIn:Play()
-	fadeIn.Completed:Once(function() -- Once auto-disconnects, so no connection is leaked
+	fadeIn.Completed:Connect(function() -- Connect auto-disconnects, so no connection is leaked
 		local fadeOut = TweenService:Create(highlight, TweenInfo.new(0.1), { FillTransparency = 1 })
 		fadeOut:Play()
-		fadeOut.Completed:Once(function()
+		fadeOut.Completed:Connect(function()
 			highlight:Destroy() -- prevents highlights piling up (Roblox caps active Highlights)
 		end)
 	end)
@@ -119,7 +120,7 @@ local function showText(targetRoot: BasePart, text: string, color: Color3)
 	local peak = CFrame.new(startPos + Vector3.new(0, math.random(25, 45) / 10, 0))
 	local rise = TweenService:Create(anchor, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { CFrame = peak })
 	rise:Play()
-	rise.Completed:Once(function()
+	rise.Completed:Connect(function()
 		local fall = TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.In) -- Quad In accelerates like gravity
 		TweenService:Create(anchor, fall, { CFrame = peak * CFrame.new(0, -2, 0) }):Play()
 	end)
@@ -268,106 +269,6 @@ local function startPostureRegen()
 	end)
 end
 
---// Demo arena: three dummies that each show a different mechanic ---------------------------------
-local ATTACKS = {
-	{ Text = "Light attack", Key = Enum.KeyCode.E, Damage = 10, PostureCost = 35, Blockable = true },
-	{ Text = "Unblockable", Key = Enum.KeyCode.F, Damage = 20, PostureCost = 0, Blockable = false },
-}
+startPostureRegen() -- begins regenerating posture for every model tagged "Combatant"
 
-local DUMMIES = {
-	{ Name = "Training Dummy", Position = Vector3.new(-12, 3, -20), Color = Color3.fromRGB(200, 200, 200), Attributes = {} },
-	{ Name = "Blocker", Position = Vector3.new(0, 3, -20), Color = Color3.fromRGB(255, 138, 70), Attributes = { IsBlocking = true } },
-	{ Name = "Parry Master", Position = Vector3.new(12, 3, -20), Color = Color3.fromRGB(255, 85, 255), Attributes = { PerfectBlock = true } },
-}
-
-local function swing(attacker: Model?, target: BasePart, attack)
-	local root = attacker and attacker:FindFirstChild("HumanoidRootPart")
-	if not root or attacker:GetAttribute("Staggered") then
-		return -- a staggered or character-less player cannot attack
-	end
-	local now = os.clock() -- monotonic, unaffected by system time changes
-	if now - (attacker:GetAttribute("LastSwing") or 0) < CONFIG.SwingCooldown then
-		return
-	end
-	attacker:SetAttribute("LastSwing", now)
-	root.CFrame = CFrame.lookAt(root.Position, Vector3.new(target.Position.X, root.Position.Y, target.Position.Z)) -- face the target on the ground plane so the box lands on it
-	Hitbox.new({
-		Character = attacker,
-		Size = Vector3.new(6, 6, 6),
-		Offset = CFrame.new(0, 0, -3.5), -- negative Z is "forward" for a CFrame
-		Damage = attack.Damage,
-		PostureCost = attack.PostureCost,
-		Blockable = attack.Blockable,
-	}):Start()
-end
-
-local function spawnDummy(def)
-	local model = Instance.new("Model")
-	model.Name = def.Name
-
-	local root = Instance.new("Part") -- the combat code looks for a part named HumanoidRootPart
-	root.Name = "HumanoidRootPart"
-	root.Size = Vector3.new(2, 5, 1.5)
-	root.Color = def.Color
-	root.Anchored = true -- keeps the dummy in place and its facing fixed for the backstab check
-	root.CFrame = CFrame.lookAt(def.Position, def.Position + Vector3.zAxis) -- face +Z so players near the origin are in front
-	root.Parent = model
-
-	local head = Instance.new("Part") -- the Humanoid only shows its name tag above a part named Head
-	head.Name = "Head"
-	head.Size = Vector3.new(2, 1, 1)
-	head.Color = def.Color
-	head.Anchored = true
-	head.CFrame = root.CFrame * CFrame.new(0, 3, 0)
-	head.Parent = model
-
-	local humanoid = Instance.new("Humanoid")
-	humanoid.DisplayName = def.Name
-	humanoid.Parent = model
-	model.PrimaryPart = root
-
-	for key, value in def.Attributes do
-		model:SetAttribute(key, value) -- applies the dummy's guard mode (IsBlocking, PerfectBlock, or none)
-	end
-	model:SetAttribute("Posture", CONFIG.MaxPosture)
-	CollectionService:AddTag(model, "Combatant") -- opts into the shared posture regen loop
-
-	if def.Attributes.IsBlocking then
-		model:GetAttributeChangedSignal("IsBlocking"):Connect(function()
-			if not model:GetAttribute("IsBlocking") then -- guard was broken
-				task.delay(CONFIG.GuardBreakStagger + 1, function()
-					if model.Parent then -- the dummy might have died meanwhile
-						model:SetAttribute("IsBlocking", true) -- raises the guard again so the demo is repeatable
-						model:SetAttribute("Posture", CONFIG.MaxPosture)
-					end
-				end)
-			end
-		end)
-	end
-
-	for index, attack in ATTACKS do
-		local prompt = Instance.new("ProximityPrompt") -- built-in input for PC, mobile and console without a client script
-		prompt.ObjectText = def.Name
-		prompt.ActionText = attack.Text
-		prompt.KeyboardKeyCode = attack.Key
-		prompt.HoldDuration = 0
-		prompt.MaxActivationDistance = 10
-		prompt.RequiresLineOfSight = false
-		prompt.UIOffset = Vector2.new(0, (index - 1) * 70) -- stacks the prompts so they do not overlap
-		prompt.Parent = root
-		prompt.Triggered:Connect(function(player)
-			swing(player.Character, root, attack)
-		end)
-	end
-
-	humanoid.Died:Once(function()
-		Debris:AddItem(model, 2)
-		task.delay(4, spawnDummy, def) -- respawns so the demo never runs out of targets
-	end)
-	model.Parent = workspace
-end
-
-startPostureRegen()
-for _, def in DUMMIES do
-	spawnDummy(def)
-end
+return Hitbox
