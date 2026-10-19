@@ -1,6 +1,5 @@
 -- Discord: Nezz(efsbxk) | Roblox: MOU7EB
 -- Combat hitbox system: overlap hitboxes, blocking, perfect blocks, backstabs and a posture meter.
--- Place as a Script in ServerScriptService. Self-contained (no modules or assets); builds its own demo arena.
 
 --// Services
 local CollectionService = game:GetService("CollectionService") -- tags let ONE loop manage every combatant
